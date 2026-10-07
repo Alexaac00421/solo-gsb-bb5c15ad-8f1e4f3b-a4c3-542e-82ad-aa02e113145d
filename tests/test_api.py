@@ -1,11 +1,16 @@
+import asyncio
 import hashlib
 import io
+import os
 import sqlite3
+import tempfile
 import threading
 
 import pytest
 from PIL import Image
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.datastructures import UploadFile
 
 from app.config import Settings
 from app.imaging import load_oriented, render_publication
@@ -81,6 +86,167 @@ def test_unsupported_format(client):
     r = upload(client, buf.getvalue(), "x.gif")
     assert r.status_code == 415
     assert r.json()["detail"]["code"] == "unsupported_media_type"
+
+
+def test_empty_upload(client):
+    r = client.post("/documents", files={"file": ("empty.png", b"")})
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "empty_upload"
+
+
+# ---------------- 上传大小上限（分块有界读取） ----------------
+
+def app_with_limit(tmp_path, limit):
+    settings = Settings(
+        data_dir=str(tmp_path / "data"), max_upload_bytes=limit
+    )
+    return create_app(settings), settings
+
+
+def doc_count(settings):
+    db = sqlite3.connect(settings.db_path)
+    try:
+        return db.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    finally:
+        db.close()
+
+
+def test_upload_exactly_at_limit_accepted(tmp_path):
+    data = png_bytes()
+    app, settings = app_with_limit(tmp_path, len(data))
+    with TestClient(app) as c:
+        r = upload(c, data)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["original_sha256"] == hashlib.sha256(data).hexdigest()
+    assert (body["width"], body["height"]) == (40, 30)
+    # 恰好达到上限：原图落盘、文档建档
+    assert os.listdir(settings.originals_dir) == [body["doc_id"] + ".png"]
+    assert doc_count(settings) == 1
+
+
+def test_upload_one_byte_over_limit_rejected(tmp_path):
+    data = png_bytes()
+    app, settings = app_with_limit(tmp_path, len(data) - 1)
+    with TestClient(app) as c:
+        r = upload(c, data)
+    assert r.status_code == 413
+    assert r.json()["detail"]["code"] == "payload_too_large"
+    # 不写文档、不落原图
+    assert os.listdir(settings.originals_dir) == []
+    assert doc_count(settings) == 0
+
+
+def test_upload_oversized_junk_gets_413_not_decode_error(tmp_path):
+    # 超限检查在读取阶段完成，先于解码：超限的非图像字节也是 413 而非 400
+    app, settings = app_with_limit(tmp_path, 64)
+    with TestClient(app) as c:
+        r = upload(c, b"not an image" * 100)
+    assert r.status_code == 413
+    assert r.json()["detail"]["code"] == "payload_too_large"
+    assert os.listdir(settings.originals_dir) == []
+    assert doc_count(settings) == 0
+
+
+def test_upload_read_is_bounded_and_stops_at_limit(tmp_path, monkeypatch):
+    # 端到端：3 MiB 上传、1 MiB 上限。读取必须分块且在首次超限后停止——
+    # 旧实现一次性 read() 整份（3 MiB），本用例会失败。
+    limit = 1 << 20
+    app, _ = app_with_limit(tmp_path, limit)
+    reads = []
+    original_read = UploadFile.read
+
+    async def spy_read(self, size=-1):
+        data = await original_read(self, size)
+        reads.append(len(data))
+        return data
+
+    monkeypatch.setattr(UploadFile, "read", spy_read)
+    with TestClient(app) as c:
+        r = upload(c, b"\0" * (3 * limit))
+    assert r.status_code == 413
+    assert r.json()["detail"]["code"] == "payload_too_large"
+    assert reads, "endpoint never read the upload"
+    assert max(reads) <= 1 << 20            # 单次读取以块为界
+    assert sum(reads) <= limit + (1 << 20)  # 累计不超过 上限 + 一个块
+
+
+class _FakeUpload:
+    """鸭子类型 UploadFile：按块供字节，记录读取位置与关闭。"""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.pos = 0
+        self.filename = "fake.png"
+        self.closed = False
+
+    async def read(self, size=-1):
+        if self.pos >= len(self._payload):
+            return b""
+        end = len(self._payload) if size < 0 else min(
+            self.pos + size, len(self._payload)
+        )
+        data = self._payload[self.pos:end]
+        self.pos = end
+        return data
+
+    async def close(self):
+        self.closed = True
+
+
+def _upload_endpoint(app):
+    for route in app.routes:
+        if (
+            getattr(route, "path", "") == "/documents"
+            and "POST" in getattr(route, "methods", ())
+        ):
+            return route.endpoint
+    raise AssertionError("upload endpoint not found")
+
+
+def test_oversized_upload_closes_stream_at_first_excess(tmp_path):
+    # 直接调用端点：累计字节首次超限即停止读取并关闭上传流（清理临时文件）
+    limit = 1 << 20
+    app, _ = app_with_limit(tmp_path, limit)
+    endpoint = _upload_endpoint(app)
+    fake = _FakeUpload(b"\0" * (3 * limit))
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(endpoint(fake))
+    assert excinfo.value.status_code == 413
+    assert excinfo.value.detail["code"] == "payload_too_large"
+    assert fake.closed                       # 本次上传流已关闭（临时文件清理）
+    assert fake.pos <= limit + (1 << 20)     # 首次超限即停止读取
+
+
+def test_oversized_upload_cleans_spooled_temp_file(tmp_path, monkeypatch):
+    # 超过 1 MiB 的上传会被 Starlette 溢出到系统临时目录；413 后不得残留
+    spool_dir = tmp_path / "spool"
+    spool_dir.mkdir()
+    monkeypatch.setenv("TMPDIR", str(spool_dir))
+    monkeypatch.setattr(tempfile, "tempdir", None)  # 重新按 TMPDIR 取临时目录
+    app, settings = app_with_limit(tmp_path, 1 << 19)  # 512 KiB
+    with TestClient(app) as c:
+        r = upload(c, b"\0" * (3 << 20))
+    assert r.status_code == 413
+    assert r.json()["detail"]["code"] == "payload_too_large"
+    assert os.listdir(spool_dir) == []
+    assert os.listdir(settings.originals_dir) == []
+    assert doc_count(settings) == 0
+
+
+def test_original_write_failure_leaves_no_trace(tmp_path):
+    # 原图落盘失败：返回 500，且不留部分文件、不写文档记录
+    app, settings = app_with_limit(tmp_path, 1 << 20)
+    with TestClient(app) as c:
+        os.chmod(settings.originals_dir, 0o500)  # 目录只读：落盘必失败
+        try:
+            r = upload(c, png_bytes())
+        finally:
+            os.chmod(settings.originals_dir, 0o700)
+    assert r.status_code == 500
+    assert r.json()["detail"]["code"] == "original_write_failed"
+    assert os.listdir(settings.originals_dir) == []
+    assert doc_count(settings) == 0
 
 
 def test_document_not_found(client):

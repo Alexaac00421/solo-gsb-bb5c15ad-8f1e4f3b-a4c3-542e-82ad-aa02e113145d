@@ -463,15 +463,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/documents", status_code=201)
     async def upload_document(file: UploadFile = File(...)) -> dict:
-        data = await file.read()
-        if not data:
-            _error(400, "empty_upload", "uploaded file is empty")
-        if len(data) > settings.max_upload_bytes:
+        # 分块流式读取上传内容：进程内存占用以“上限 + 一个块”为界，超限文件
+        # 不会整体驻留内存；累计字节首次超过上限即停止读取并拒绝，恰好达到
+        # 上限的文件照常处理。SHA-256 随读随算，仍覆盖原始字节。
+        filename = file.filename or ""
+        buf = bytearray()
+        hasher = hashlib.sha256()
+        too_large = False
+        try:
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                if len(buf) + len(chunk) > settings.max_upload_bytes:
+                    too_large = True
+                    break
+                hasher.update(chunk)
+                buf.extend(chunk)
+        finally:
+            # 关闭上传流：本次上传溢出到系统临时目录的临时文件随之删除，
+            # 超限拒绝或读取失败都不留下本次临时文件。
+            await file.close()
+        if too_large:
             _error(
                 413,
                 "payload_too_large",
-                f"file is {len(data)} bytes, limit is {settings.max_upload_bytes}",
+                f"file exceeds the limit of {settings.max_upload_bytes} bytes",
             )
+        if not buf:
+            _error(400, "empty_upload", "uploaded file is empty")
+        data = bytes(buf)
         try:
             oriented, fmt = load_oriented(data)
         except ImageDecodeError as exc:
@@ -484,12 +505,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         doc_id = uuid.uuid4().hex
-        digest = _sha256_bytes(data)
+        digest = hasher.hexdigest()
         original_path = os.path.abspath(
             os.path.join(settings.originals_dir, doc_id + SUPPORTED_FORMATS[fmt])
         )
-        with open(original_path, "wb") as f:
-            f.write(data)
+        try:
+            with open(original_path, "xb") as f:  # doc_id 全新生成，独占创建
+                f.write(data)
+        except FileExistsError:
+            # 全新 doc_id 下几乎不可能发生；绝不覆盖或删除既有文件
+            _error(
+                500,
+                "original_write_failed",
+                "failed to store the uploaded original: target already exists",
+            )
+        except OSError as exc:
+            # 落盘失败：清理可能已部分写入的原图，不留半成品
+            _cleanup_tempfile(original_path)
+            _error(
+                500,
+                "original_write_failed",
+                f"failed to store the uploaded original: {exc}",
+            )
 
         width, height = oriented.size
         now = _utcnow()
@@ -501,7 +538,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     " VALUES (?,?,?,?,?,?,?,0,?)",
                     (
                         doc_id,
-                        file.filename or "",
+                        filename,
                         MEDIA_TYPES[fmt],
                         original_path,
                         digest,
@@ -516,7 +553,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise
         return {
             "doc_id": doc_id,
-            "filename": file.filename or "",
+            "filename": filename,
             "media_type": MEDIA_TYPES[fmt],
             "width": width,
             "height": height,

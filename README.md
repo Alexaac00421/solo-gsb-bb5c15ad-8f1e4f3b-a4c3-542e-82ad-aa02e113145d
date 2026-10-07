@@ -55,7 +55,7 @@ python -m pytest tests/ -q
 | 环境变量        | 默认值   | 说明                                       |
 | --------------- | -------- | ------------------------------------------ |
 | `DATA_DIR`      | `./data`（容器内 `/data`） | SQLite 库、原图、发布成品的存放根目录 |
-| `MAX_UPLOAD_MB` | `25`     | 单个上传文件大小上限（MB）                 |
+| `MAX_UPLOAD_MB` | `25`     | 单个上传文件大小上限（MB）；分块有界读取，超限即拒 |
 | `MAX_VERIFY_MB` | `512`    | 归档核验上传 ZIP 大小上限（MB）；核验只读临时文件、不解压到 `DATA_DIR` |
 | `MAX_RESTORE_MB` | `512`   | 归档恢复上传 ZIP 大小上限（MB）；恢复先落系统临时目录，核验通过才写入 `DATA_DIR` |
 | `PREVIEW_ADMIN_KEY` | _未设置_ | 定时公开前**内审预览凭证颁发**所需的本地管理员密钥；未设置/纯空白时颁发端点 fail-closed 拒绝（503），领取端点只认一次性凭证、不使用该密钥。密钥不入库、不进归档 |
@@ -67,7 +67,7 @@ python -m pytest tests/ -q
 
 | 方法 | 路径 | 说明 |
 | ---- | ---- | ---- |
-| POST | `/documents` | 上传原图（multipart 字段名 `file`），返回 `doc_id` 与旋正后宽高 |
+| POST | `/documents` | 上传原图（multipart 字段名 `file`；分块有界读取，超过 `MAX_UPLOAD_MB` 即 413），返回 `doc_id` 与旋正后宽高 |
 | GET  | `/documents/{doc_id}` | 文档元数据与发布列表 |
 | GET  | `/documents/{doc_id}/annotations` | 当前标注修订号与矩形 |
 | PUT  | `/documents/{doc_id}/annotations` | 整体替换标注，须携带当前修订号 |
@@ -96,6 +96,12 @@ BASE=http://localhost:8000
 # 1) 上传原图 -> 记下 doc_id、width/height（EXIF 旋正后的坐标系）
 DOC=$(curl -s -F "file=@scan.jpg" $BASE/documents)
 DOC_ID=$(echo "$DOC" | python3 -c "import sys,json;print(json.load(sys.stdin)['doc_id'])")
+
+# 1b) 超过 MAX_UPLOAD_MB 的上传：分块读取、累计字节首次超限即拒绝，
+#     不写文档也不落原图（恰好达到上限的文件照常处理）
+curl -s -F "file=@too-big.png" $BASE/documents
+# -> HTTP 413 {"detail":{"code":"payload_too_large",
+#              "message":"file exceeds the limit of 26214400 bytes"}}
 
 # 2) 标注敏感矩形（x,y 为左上角，w/h 为宽高，坐标基于旋正后图像）
 curl -s -X PUT $BASE/documents/$DOC_ID/annotations \
@@ -156,8 +162,9 @@ curl -s -X POST $BASE/documents/$DOC_ID/coverage-diff \
 `examples/demo_scheduled_publication.sh`（定时公开流程）、
 `examples/demo_preview.sh`（定时公开前内审预览凭证流程）、
 `examples/demo_withdrawal.sh`（版本撤回流程）、
-`examples/demo_migration.sh`（遮盖方案迁移流程）与
-`examples/demo_coverage_diff.sh`（重发前遮盖范围比较流程）；
+`examples/demo_migration.sh`（遮盖方案迁移流程）、
+`examples/demo_coverage_diff.sh`（重发前遮盖范围比较流程）与
+`examples/demo_upload_limits.sh`（上传大小上限：正常/恰好达限/超限调用）；
 先启动服务，再执行 `bash examples/demo_scheduled_publication.sh`。
 预览示例需要服务带密钥启动，如：
 `PREVIEW_ADMIN_KEY=dev-admin-key uvicorn app.main:app --port 8000`
@@ -919,6 +926,7 @@ BASE=http://localhost:8000 TARGET_BASE=http://localhost:8001 \
 | 409 | `stale_revision` | 标注修订号过期（响应附 `current_revision`；批次/迁移场景另附 `position`/`doc_id`/`supplied_revision`，迁移源侧附 `doc_id`；遮盖范围比较附 `current_revision`/`supplied_revision`） |
 | 409 | `idempotency_key_conflict` | 幂等键已用于不同内容的批次请求（原批次不受影响） |
 | 500 | `original_unavailable` | 存储的原图无法读取/解码（批次场景附 `position`/`doc_id`） |
+| 500 | `original_write_failed` | 上传原图落盘失败（可能部分写入的文件已清理，不留半成品） |
 | 500 | `artifact_write_failed` | 发布成品写入磁盘失败（附 `position`/`doc_id`/`version`） |
 | 500 | `artifact_missing` | 发布成品在磁盘上缺失（单份图片读取；离线交付包附 `position`/`doc_id`/`version`） |
 | 500 | `artifact_read_failed` | 离线交付包读成品文件失败（附 `position`/`doc_id`/`version`） |
@@ -941,11 +949,18 @@ BASE=http://localhost:8000 TARGET_BASE=http://localhost:8001 \
 | 409 | `restore_target_conflict` | 归档恢复的目标文件已存在（附 `path`/`doc_id`/`version`，绝不覆盖） |
 | 500 | `restore_file_write_failed` | 归档恢复文件落盘失败（附 `path`/`doc_id`；整体回滚并清理本次文件） |
 | 500 | `restore_write_failed` | 归档恢复记录写库失败（整体回滚并清理本次文件） |
-| 413 | `payload_too_large` | 超过上传大小上限 |
+| 413 | `payload_too_large` | 上传超过 `MAX_UPLOAD_MB`（分块读取，累计字节首次超限即拒绝，不写文档/原图） |
 | 415 | `unsupported_media_type` | 非 PNG/JPEG（如 GIF） |
 
 ## 一致性设计
 
+- **上传有界读取**：`POST /documents` 以 1 MiB 分块读取上传流，进程内存占用
+  以“上限 + 一个块”为界；累计字节首次超过 `MAX_UPLOAD_MB` 即停止读取、关闭
+  上传流（本次上传溢出到系统临时目录的临时文件随之清理）并返回
+  `413 payload_too_large`，不写文档记录也不落原图；恰好达到上限的文件照常
+  解码建档。SHA-256 随读随算、仍覆盖原始字节。读取或解码失败发生在任何写盘
+  之前；原图落盘失败（`500 original_write_failed`）清理可能已部分写入的
+  文件；建库记录失败仍清理已落盘原图——任何失败都不留半成品。
 - **坐标系**：上传时以 `ImageOps.exif_transpose` 旋正，标注、涂实、发布全部在旋正后
   的像素坐标上进行，与查看器所见方向一致。
 - **乐观锁**：`PUT /documents/{id}/annotations` 要求 `revision` 等于服务端当前修订号，
@@ -1053,7 +1068,9 @@ app/
   config.py   # 环境变量配置
   archive_verify.py  # 服务数据归档 ZIP 的交接前核验（纯只读，不落盘）
   archive_restore.py # 归档恢复计划解析（纯解析，无副作用；写库/落盘在路由写事务内）
-tests/test_api.py    # 16 个用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性
+tests/test_api.py    # 24 个用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性、
+                     #   上传上限（恰好达限/超限不留痕/分块有界读取/临时文件清理/
+                     #   落盘失败不留半成品）
 tests/test_batch.py  # 12 个用例：批次成功/顺序、数量与重复、文档缺失/修订过期/
                      #   原图不可读/写盘失败的整批回滚、版本交错、不可变性、并发
 tests/test_idempotency.py  # 10 个用例：幂等重放、内容绑定（含公开时间）、冲突、
@@ -1104,10 +1121,33 @@ examples/demo_archive_verify.sh  # 归档核验（有效计数 + 篡改后可定
 examples/demo_restore.sh     # 归档恢复（源实例取归档 -> 空目标实例恢复 -> 拒绝演示）端到端示例
 examples/demo_migration.sh   # 遮盖方案迁移端到端 curl 示例
 examples/demo_coverage_diff.sh  # 重发前遮盖范围比较端到端 curl 示例
+examples/demo_upload_limits.sh  # 上传大小上限（正常/恰好达限/超限）端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（服务数据归档恢复）
+## 本轮变动（上传有界内存读取）
+
+- `POST /documents` 改为**分块流式读取**上传内容（每块 1 MiB）：此前先整份
+  `read()` 再检查 `MAX_UPLOAD_MB`，超限文件可在应返回 413 前占满进程内存；
+  现在进程内存占用以“上限 + 一个块”为界。
+- **累计字节首次超限即拒绝**：停止读取、关闭上传流（本次上传溢出到系统临时
+  目录的临时文件随之清理），返回原有的 `413 payload_too_large`；**不写文档
+  记录、不落原图**。流式拒绝时无法获知文件总大小，错误体 message 相应改为
+  “超过上限”表述（状态码与 `code` 不变）。**恰好达到上限**的文件照常处理。
+- 有效 PNG/JPEG 行为不变：SHA-256 随读随算、仍按原始字节计算，以 EXIF 旋正
+  后尺寸建档；响应字段及 `400 empty_upload`、`400 image_decode_failed`、
+  `415 unsupported_media_type` 的既有行为全部保持。
+- **失败不留半成品**：上传流读取失败在关闭上传流后向上传播，不产生任何
+  记录；解码失败发生在任何写盘之前；原图落盘失败（新增
+  `500 original_write_failed`）清理可能已部分写入的文件；建库记录失败仍
+  清理已落盘原图。
+- 新增测试（上限边界、超限不留痕、分块有界读取、临时文件清理、落盘失败）
+  与示例 `examples/demo_upload_limits.sh`（正常/恰好达限/超限调用，需以
+  较小 `MAX_UPLOAD_MB` 启动服务，如 `MAX_UPLOAD_MB=1`）。**不新增任何数据表
+  或列**，其他路由、请求/响应字段及启动方式（Docker Compose / uvicorn）
+  全部保持兼容。
+
+## 历史变动（服务数据归档恢复）
 
 - 新增 `POST /service-data-archives/restore`：运维把本服务导出的归档 ZIP
   整体恢复到**空实例**（`multipart/form-data`，字段名 `file`）。上传先流式
