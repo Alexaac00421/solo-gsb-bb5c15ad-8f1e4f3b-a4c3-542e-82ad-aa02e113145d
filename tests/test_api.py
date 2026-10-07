@@ -1,10 +1,14 @@
+import asyncio
 import hashlib
 import io
+import os
 import sqlite3
+import tempfile
 import threading
 
 import pytest
 from PIL import Image
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -81,6 +85,149 @@ def test_unsupported_format(client):
     r = upload(client, buf.getvalue(), "x.gif")
     assert r.status_code == 415
     assert r.json()["detail"]["code"] == "unsupported_media_type"
+
+
+def _app_with_limit(tmp_path, max_bytes: int):
+    """以指定上传字节上限创建 app/client（默认 25MB 对小测试不触发）。"""
+    settings = Settings(data_dir=str(tmp_path / "data"), max_upload_bytes=max_bytes)
+    app = create_app(settings)
+    return settings, TestClient(app)
+
+
+def test_upload_at_exact_limit_succeeds(tmp_path):
+    # 恰好等于上限仍可处理（边界保持"等于可处理"）
+    data = png_bytes()
+    settings, client = _app_with_limit(tmp_path, len(data))
+    with client:
+        r = upload(client, data)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["original_sha256"] == hashlib.sha256(data).hexdigest()
+    # 原图按原始字节落盘且可复算摘要
+    stored = os.path.join(
+        settings.originals_dir, body["doc_id"] + ".png"
+    )
+    with open(stored, "rb") as f:
+        assert f.read() == data
+
+
+def test_upload_one_byte_over_limit_rejected(tmp_path):
+    # 超过上限 1 字节即 413；不写文档、不留原图
+    data = png_bytes()
+    settings, client = _app_with_limit(tmp_path, len(data) - 1)
+    with client:
+        r = upload(client, data)
+    assert r.status_code == 413
+    assert r.json()["detail"]["code"] == "payload_too_large"
+    assert os.listdir(settings.originals_dir) == []
+    with sqlite3.connect(settings.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+
+
+def test_oversize_upload_leaves_no_temp_files(tmp_path, monkeypatch):
+    # 413 路径清理本次系统临时文件
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    data = png_bytes()
+    settings, client = _app_with_limit(tmp_path, len(data) - 1)
+    with client:
+        assert upload(client, data).status_code == 413
+    assert os.listdir(scratch) == []
+
+
+class _ThrottledUpload:
+    """模拟分块到达的上传流：记录总共被读走的字节数。"""
+
+    def __init__(self, data: bytes, chunk: int = 64):
+        self._data = data
+        self._pos = 0
+        self._chunk = chunk
+        self.delivered = 0
+        self.filename = "big.png"
+
+    async def read(self, size: int = -1) -> bytes:
+        if self._pos >= len(self._data):
+            return b""
+        # 同时受调用方请求的 size 与本对象节流粒度限制，确保真正分块
+        n = min(size, self._chunk, len(self._data) - self._pos)
+        piece = self._data[self._pos:self._pos + n]
+        self._pos += n
+        self.delivered += n
+        return piece
+
+
+def test_upload_stops_reading_as_soon_as_limit_crossed(tmp_path):
+    # 直接驱动端点：累计字节首次越过上限即返回 413，绝不抽空整份上传流
+    # （旧实现先 file.read() 读全量，会把超限文件全部读入内存）。
+    settings, client = _app_with_limit(tmp_path, 1 << 20)  # 1 MiB
+    data = b"x" * (10 << 20)
+    throttled = _ThrottledUpload(data, chunk=64)
+    with client:
+        from fastapi.routing import APIRoute
+
+        endpoint = next(
+            r for r in client.app.routes
+            if isinstance(r, APIRoute) and r.path == "/documents"
+        ).endpoint
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(endpoint(file=throttled))
+    assert exc_info.value.status_code == 413
+    # 上限 1 MiB + 至多一个分块（64B）即停，绝未读完 10 MiB
+    assert throttled.delivered <= (1 << 20) + 64
+    assert throttled.delivered < len(data)
+    assert os.listdir(settings.originals_dir) == []
+    with sqlite3.connect(settings.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+
+
+def test_empty_upload_rejected_and_clean(tmp_path):
+    settings, client = _app_with_limit(tmp_path, 1 << 20)
+    with client:
+        r = upload(client, b"", "empty.png")
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "empty_upload"
+    assert os.listdir(settings.originals_dir) == []
+
+
+def test_failed_decode_leaves_no_files(client, tmp_path):
+    # 解码失败（400）同样不得留临时文件或原图
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    import tempfile as _tempfile
+
+    old = _tempfile.tempdir
+    _tempfile.tempdir = str(scratch)
+    try:
+        r = upload(client, b"this is definitely not an image")
+    finally:
+        _tempfile.tempdir = old
+    assert r.status_code == 400
+    assert r.json()["detail"]["code"] == "image_decode_failed"
+    assert os.listdir(scratch) == []
+
+
+def test_original_write_failure_is_cleaned_up(tmp_path, monkeypatch):
+    # 原图落位失败 -> 500 original_write_failed：临时文件/半成品原图均不残留、
+    # 不写文档记录
+    import app.main as main_module
+
+    def _boom(src, dst):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(main_module.shutil, "move", _boom)
+    settings, client = _app_with_limit(tmp_path, 1 << 20)
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    with client:
+        r = upload(client, png_bytes())
+    assert r.status_code == 500
+    assert r.json()["detail"]["code"] == "original_write_failed"
+    assert os.listdir(settings.originals_dir) == []
+    assert os.listdir(scratch) == []
+    with sqlite3.connect(settings.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
 
 
 def test_document_not_found(client):

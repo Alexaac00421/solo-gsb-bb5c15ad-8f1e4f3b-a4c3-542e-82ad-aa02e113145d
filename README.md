@@ -55,7 +55,7 @@ python -m pytest tests/ -q
 | 环境变量        | 默认值   | 说明                                       |
 | --------------- | -------- | ------------------------------------------ |
 | `DATA_DIR`      | `./data`（容器内 `/data`） | SQLite 库、原图、发布成品的存放根目录 |
-| `MAX_UPLOAD_MB` | `25`     | 单个上传文件大小上限（MB）                 |
+| `MAX_UPLOAD_MB` | `25`     | 单个上传文件大小上限（MB）；`POST /documents` 以 1MiB 分块**有界内存**流式读取并落系统临时文件，累计字节首次越限即返回 413（恰好等于上限仍处理） |
 | `MAX_VERIFY_MB` | `512`    | 归档核验上传 ZIP 大小上限（MB）；核验只读临时文件、不解压到 `DATA_DIR` |
 | `MAX_RESTORE_MB` | `512`   | 归档恢复上传 ZIP 大小上限（MB）；恢复先落系统临时目录，核验通过才写入 `DATA_DIR` |
 | `PREVIEW_ADMIN_KEY` | _未设置_ | 定时公开前**内审预览凭证颁发**所需的本地管理员密钥；未设置/纯空白时颁发端点 fail-closed 拒绝（503），领取端点只认一次性凭证、不使用该密钥。密钥不入库、不进归档 |
@@ -67,7 +67,7 @@ python -m pytest tests/ -q
 
 | 方法 | 路径 | 说明 |
 | ---- | ---- | ---- |
-| POST | `/documents` | 上传原图（multipart 字段名 `file`），返回 `doc_id` 与旋正后宽高 |
+| POST | `/documents` | 上传原图（multipart 字段名 `file`），返回 `doc_id` 与旋正后宽高；分块流式落系统临时文件、增量计算 SHA-256，内存占用以 1MiB 分块为界，超限即时 413 并清理 |
 | GET  | `/documents/{doc_id}` | 文档元数据与发布列表 |
 | GET  | `/documents/{doc_id}/annotations` | 当前标注修订号与矩形 |
 | PUT  | `/documents/{doc_id}/annotations` | 整体替换标注，须携带当前修订号 |
@@ -96,6 +96,15 @@ BASE=http://localhost:8000
 # 1) 上传原图 -> 记下 doc_id、width/height（EXIF 旋正后的坐标系）
 DOC=$(curl -s -F "file=@scan.jpg" $BASE/documents)
 DOC_ID=$(echo "$DOC" | python3 -c "import sys,json;print(json.load(sys.stdin)['doc_id'])")
+
+# 1b) 超过 MAX_UPLOAD_MB（默认 25MB）-> 413 payload_too_large。
+#     服务端按 1MiB 分块流式读取并写系统临时文件，累计字节首次越限即停止：
+#     不会把整份超限文件读入内存；临时文件随请求清理，不写文档、不留原图
+#     （恰好等于上限的文件仍会继续处理）。
+curl -s -w '\n-> HTTP %{http_code}\n' -F "file=@huge.jpg" $BASE/documents
+# -> {"detail":{"code":"payload_too_large","message":"uploaded file is larger than the limit of 26214400 bytes"}}
+# -> HTTP 413
+# 空文件 -> 400 empty_upload；损坏/截断 -> 400 image_decode_failed；GIF 等 -> 415 unsupported_media_type
 
 # 2) 标注敏感矩形（x,y 为左上角，w/h 为宽高，坐标基于旋正后图像）
 curl -s -X PUT $BASE/documents/$DOC_ID/annotations \
@@ -941,13 +950,23 @@ BASE=http://localhost:8000 TARGET_BASE=http://localhost:8001 \
 | 409 | `restore_target_conflict` | 归档恢复的目标文件已存在（附 `path`/`doc_id`/`version`，绝不覆盖） |
 | 500 | `restore_file_write_failed` | 归档恢复文件落盘失败（附 `path`/`doc_id`；整体回滚并清理本次文件） |
 | 500 | `restore_write_failed` | 归档恢复记录写库失败（整体回滚并清理本次文件） |
-| 413 | `payload_too_large` | 超过上传大小上限 |
+| 413 | `payload_too_large` | 原图上传超过 `MAX_UPLOAD_MB`（`POST /documents`：分块流式读取，累计字节首次越限即拒绝，不抽空超限文件、不落原图、不写文档）；归档核验/恢复超过 `MAX_VERIFY_MB`/`MAX_RESTORE_MB` 同理 |
 | 415 | `unsupported_media_type` | 非 PNG/JPEG（如 GIF） |
+| 500 | `original_write_failed` | 上传原图落盘（系统临时文件移入 `DATA_DIR`）失败；本次临时文件与任何半成品原图均已清理，文档未登记 |
 
 ## 一致性设计
 
 - **坐标系**：上传时以 `ImageOps.exif_transpose` 旋正，标注、涂实、发布全部在旋正后
   的像素坐标上进行，与查看器所见方向一致。
+- **有界内存上传（全有或全无）**：`POST /documents` 不再先读整份原图再判大小，而是
+  按 1MiB 分块边读边写**系统临时目录**、边增量计算 SHA-256，进程内存常驻至多一个
+  分块（外加 PIL 解码占用）。累计字节**首次超过** `MAX_UPLOAD_MB` 即停止读取并返回
+  `413 payload_too_large`（**恰好等于上限仍处理**）；空文件 `400 empty_upload`、
+  损坏/截断 `400 image_decode_failed`、非 PNG/JPEG `415 unsupported_media_type` 判定
+  顺序与字段保持不变。任何失败出口都清理本次临时文件：不写文档记录、不留原图；
+  成功路径的原图为系统临时文件 `shutil.move` 落位（同盘原子 rename、跨盘复制后删除），
+  落位或写库失败同样删除已落文件，有效 PNG/JPEG 仍按原始字节计算 SHA-256、以 EXIF
+  旋正后的尺寸建档，响应字段不变。
 - **乐观锁**：`PUT /documents/{id}/annotations` 要求 `revision` 等于服务端当前修订号，
   在 `BEGIN IMMEDIATE` 事务内 check-and-set，过期即 409，不会丢失他人修改。
 - **方案迁移**：`POST /annotation-migrations` 在**一个** `BEGIN IMMEDIATE` 事务内
@@ -1104,10 +1123,32 @@ examples/demo_archive_verify.sh  # 归档核验（有效计数 + 篡改后可定
 examples/demo_restore.sh     # 归档恢复（源实例取归档 -> 空目标实例恢复 -> 拒绝演示）端到端示例
 examples/demo_migration.sh   # 遮盖方案迁移端到端 curl 示例
 examples/demo_coverage_diff.sh  # 重发前遮盖范围比较端到端 curl 示例
+examples/demo_upload_limits.sh  # 原图上传：正常 PNG/JPEG + 超限 413/空文件/损坏/非 PNG·JPEG 端到端示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（服务数据归档恢复）
+## 本轮变动（原图上传有界内存化）
+
+- 修复 `POST /documents` 的内存放大问题：旧实现先 `file.read()` 读取**整份原图**
+  再检查 `MAX_UPLOAD_MB`，超限文件可在应返回 413 之前占满进程内存。现改为按
+  **1MiB 分块有界内存**流式读取——边落**系统临时目录**边增量计算 SHA-256，
+  累计字节**首次超过**上限即停止读取并返回既有 `413 payload_too_large`（消息体仍为
+  统一错误结构；**恰好等于上限继续处理**），超限部分不再进入进程内存。
+- **全有或全无、不留半成品**：413/400 `empty_upload`/400 `image_decode_failed`/
+  415 `unsupported_media_type` 等所有失败出口都清理本次系统临时文件，**不写文档记录、
+  不留原图**；成功路径的原图经 `shutil.move` 落位（同盘原子 rename，跨盘复制后删除），
+  落位失败或随后写库失败同样删除已落文件与记录。
+- 有效 PNG/JPEG 的行为与响应字段完全不变：仍按**原始上传字节**计算 SHA-256、
+  **EXIF 旋正后**的 `width`/`height` 建档（解码直接从临时文件流式打开，不额外
+  整体读入内存），返回 `doc_id`/`filename`/`media_type`/`width`/`height`/
+  `original_sha256`/`annotation_revision`/`created_at`。
+- 新增 `app/imaging.py::load_oriented_file`（与 `load_oriented` 同口径的磁盘路径
+  解码）与测试（边界、超限拒绝/不抽空上传流、临时文件清理、空文件/解码失败清理等）、
+  端到端示例 `examples/demo_upload_limits.sh`（正常 + 超限调用）。**不新增任何
+  数据表或列**，除 413 消息文案外，上传及其余所有端点的路由、请求/响应字段与启动方式
+  （Docker Compose / uvicorn）全部保持兼容。
+
+## 历史变动（服务数据归档恢复）
 
 - 新增 `POST /service-data-archives/restore`：运维把本服务导出的归档 ZIP
   整体恢复到**空实例**（`multipart/form-data`，字段名 `file`）。上传先流式

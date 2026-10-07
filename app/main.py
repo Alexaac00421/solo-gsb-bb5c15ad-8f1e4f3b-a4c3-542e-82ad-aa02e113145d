@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import uuid
@@ -36,6 +37,7 @@ from .imaging import (
     UnsupportedFormatError,
     coverage_diff,
     load_oriented,
+    load_oriented_file,
     render_publication,
     scale_rect,
 )
@@ -51,6 +53,10 @@ from .models import (
 )
 
 MEDIA_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg"}
+
+# 上传分块读取大小：原图按块流式落临时文件、增量计算 SHA-256，
+# 内存常驻至多一个块（外加解码器本身占用），而非整份原图。
+UPLOAD_CHUNK_SIZE = 1 << 20  # 1 MiB
 
 # 定时公开的最大提前量：首次提交时公开时间不得晚于当前时刻 30 天
 MAX_PUBLISH_DELAY = timedelta(days=30)
@@ -463,57 +469,106 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/documents", status_code=201)
     async def upload_document(file: UploadFile = File(...)) -> dict:
-        data = await file.read()
-        if not data:
-            _error(400, "empty_upload", "uploaded file is empty")
-        if len(data) > settings.max_upload_bytes:
-            _error(
-                413,
-                "payload_too_large",
-                f"file is {len(data)} bytes, limit is {settings.max_upload_bytes}",
-            )
+        # 有界内存上传：分块读取 multipart 文件流，边落**系统临时目录**边
+        # 增量计算 SHA-256，进程内存常驻至多一个分块而非整份原图。累计字节
+        # **首次超过** MAX_UPLOAD_MB 即停止读取并返回既有
+        # 413 payload_too_large（恰好等于上限仍继续处理）。临时文件在任何
+        # 出口（413/400/415/落盘失败/写库失败）都被清理：不写文档记录、
+        # 不留本次原图。
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="doc-upload-", suffix=".img")
+        total = 0
+        too_large = False
+        hasher = hashlib.sha256()
         try:
-            oriented, fmt = load_oriented(data)
-        except ImageDecodeError as exc:
-            _error(400, "image_decode_failed", f"cannot decode image: {exc}")
-        except UnsupportedFormatError as exc:
-            _error(
-                415,
-                "unsupported_media_type",
-                f"only PNG and JPEG are supported, got format: {exc}",
-            )
-
-        doc_id = uuid.uuid4().hex
-        digest = _sha256_bytes(data)
-        original_path = os.path.abspath(
-            os.path.join(settings.originals_dir, doc_id + SUPPORTED_FORMATS[fmt])
-        )
-        with open(original_path, "wb") as f:
-            f.write(data)
-
-        width, height = oriented.size
-        now = _utcnow()
-        try:
-            with write_tx(settings.db_path) as conn:
-                conn.execute(
-                    "INSERT INTO documents (id, filename, media_type, original_path,"
-                    " original_sha256, width, height, annotation_revision, created_at)"
-                    " VALUES (?,?,?,?,?,?,?,0,?)",
-                    (
-                        doc_id,
-                        file.filename or "",
-                        MEDIA_TYPES[fmt],
-                        original_path,
-                        digest,
-                        width,
-                        height,
-                        now,
-                    ),
+            with os.fdopen(tmp_fd, "wb") as out:
+                while True:
+                    chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > settings.max_upload_bytes:
+                        too_large = True
+                        break
+                    out.write(chunk)
+                    hasher.update(chunk)
+            if too_large:
+                _error(
+                    413,
+                    "payload_too_large",
+                    f"uploaded file is larger than the limit of"
+                    f" {settings.max_upload_bytes} bytes",
                 )
-        except Exception:
-            if os.path.exists(original_path):
-                os.unlink(original_path)
-            raise
+            if total == 0:
+                _error(400, "empty_upload", "uploaded file is empty")
+            digest = hasher.hexdigest()
+
+            # 直接从临时文件流式解码，同样不把整份原图读入内存；错误语义
+            # 与既有行为一致：损坏/截断 400 image_decode_failed，
+            # 非 PNG/JPEG 415 unsupported_media_type。
+            try:
+                oriented, fmt = load_oriented_file(tmp_path)
+            except ImageDecodeError as exc:
+                _error(400, "image_decode_failed", f"cannot decode image: {exc}")
+            except UnsupportedFormatError as exc:
+                _error(
+                    415,
+                    "unsupported_media_type",
+                    f"only PNG and JPEG are supported, got format: {exc}",
+                )
+
+            doc_id = uuid.uuid4().hex
+            original_path = os.path.abspath(
+                os.path.join(settings.originals_dir, doc_id + SUPPORTED_FORMATS[fmt])
+            )
+            # 系统临时目录与 DATA_DIR 可能不在同一文件系统：同盘走原子
+            # rename，跨盘回退为复制后删除；任一失败都清理可能已写出的
+            # 半成品原图，且不进入文档登记。
+            try:
+                shutil.move(tmp_path, original_path)
+            except Exception as exc:
+                if os.path.exists(original_path):
+                    try:
+                        os.unlink(original_path)
+                    except OSError:
+                        pass
+                _error(
+                    500,
+                    "original_write_failed",
+                    f"failed to store the uploaded original: {exc}",
+                )
+            tmp_path = ""  # 原图已就位：finally 不再删除临时文件
+
+            width, height = oriented.size
+            now = _utcnow()
+            try:
+                with write_tx(settings.db_path) as conn:
+                    conn.execute(
+                        "INSERT INTO documents (id, filename, media_type, original_path,"
+                        " original_sha256, width, height, annotation_revision, created_at)"
+                        " VALUES (?,?,?,?,?,?,?,0,?)",
+                        (
+                            doc_id,
+                            file.filename or "",
+                            MEDIA_TYPES[fmt],
+                            original_path,
+                            digest,
+                            width,
+                            height,
+                            now,
+                        ),
+                    )
+            except Exception:
+                # 记录未落盘即整体失败：原图不得残留（文件与记录全有或全无）。
+                if os.path.exists(original_path):
+                    try:
+                        os.unlink(original_path)
+                    except OSError:
+                        pass
+                raise
+        finally:
+            # 移动成功后 tmp_path 已置空；其余任何出口都在此删除本次临时文件。
+            if tmp_path:
+                _cleanup_tempfile(tmp_path)
         return {
             "doc_id": doc_id,
             "filename": file.filename or "",

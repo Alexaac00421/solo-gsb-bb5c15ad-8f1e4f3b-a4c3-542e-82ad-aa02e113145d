@@ -4,7 +4,7 @@ from __future__ import annotations
 from io import BytesIO
 from typing import Any, Iterable, Mapping
 
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 
 
@@ -203,15 +203,15 @@ class UnsupportedFormatError(Exception):
     """能解码但不是 PNG/JPEG。"""
 
 
-def load_oriented(data: bytes) -> tuple[Image.Image, str]:
-    """解码图像并按 EXIF Orientation 旋正。
+def _decode_oriented(img: Image.Image) -> tuple[Image.Image, str]:
+    """对已打开的 PIL 图像强制解码、限定格式并按 EXIF Orientation 旋正。
 
-    返回 (旋正后的图像, 原始格式)。标注坐标系即该图像的像素坐标，
-    与查看器看到的方向一致。
+    供 :func:`load_oriented` / :func:`load_oriented_file` 共用：``load()``
+    先把全部像素读入内存（尽早暴露截断/损坏数据），再判定格式与旋正，
+    因此返回后底层文件句柄是否仍打开不影响调用方移动/删除源文件。
     """
+    fmt = img.format
     try:
-        img = Image.open(BytesIO(data))
-        fmt = img.format
         img.load()  # 强制解码，尽早暴露截断/损坏数据
     except Exception as exc:
         raise ImageDecodeError(str(exc) or exc.__class__.__name__) from exc
@@ -223,6 +223,37 @@ def load_oriented(data: bytes) -> tuple[Image.Image, str]:
     except Exception as exc:
         raise ImageDecodeError(str(exc) or exc.__class__.__name__) from exc
     return oriented, fmt
+
+
+def load_oriented(data: bytes) -> tuple[Image.Image, str]:
+    """解码图像字节并按 EXIF Orientation 旋正。
+
+    返回 (旋正后的图像, 原始格式)。标注坐标系即该图像的像素坐标，
+    与查看器看到的方向一致。
+    """
+    try:
+        img = Image.open(BytesIO(data))
+    except Exception as exc:
+        raise ImageDecodeError(str(exc) or exc.__class__.__name__) from exc
+    return _decode_oriented(img)
+
+
+def load_oriented_file(path: str) -> tuple[Image.Image, str]:
+    """从磁盘路径打开图像并按 EXIF Orientation 旋正。
+
+    行为与 :func:`load_oriented` 完全一致（同样的 ImageDecodeError /
+    UnsupportedFormatError 语义与格式判定），但直接从文件流式解码：
+    调用方无需把整份原图读入内存。像素在返回前已全部 ``load()`` 读入，
+    源文件随后即可移动或删除。
+    """
+    try:
+        img = Image.open(path)
+    except UnidentifiedImageError:
+        # 该异常消息携带服务端临时路径，不向调用方透出内部路径细节。
+        raise ImageDecodeError("cannot identify image file") from None
+    except Exception as exc:
+        raise ImageDecodeError(str(exc) or exc.__class__.__name__) from exc
+    return _decode_oriented(img)
 
 
 # 各模式的"纯黑不透明"填充值
